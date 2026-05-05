@@ -97,5 +97,5 @@ class QBMBase(ABC):
         pass
 
     @abstractmethod
-    def _initialize_weights_and_biases(self):
+    def _initialize_weights_and_biases(self, W_init, b_init, Gamma_init):
         pass

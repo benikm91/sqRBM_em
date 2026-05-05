@@ -26,6 +26,10 @@ class sqRBM_em(QBMBase):
     ):
 
         self.prob_data = prob_data
+        keys = list(self.prob_data.keys())
+        self.probs = np.array([self.prob_data[i] for i in keys]).reshape(-1, 1)
+        V_batch = np.array([Discretizer.int_to_bit_vector(i, n_visible) for i in keys])
+        self.V_batch = self._binary_to_eigen(V_batch)
         self.expected_value_V = expected_value_V
         # self.Gamma = Gamma
         self.B_freeze = B_freeze
@@ -150,57 +154,52 @@ class sqRBM_em(QBMBase):
 
     def _compute_positive_grads(self):
         """
-        Computes the gradients for the positive phase
+        Computes the gradients for the positive phase (EM E-step) using vectorized NumPy.
         """
+        probs = self.probs
+        V_batch = self.V_batch
+        b_hid = self.b[self.n_visible:]
+        Gamma_hid = self.Gamma[self.n_visible:]
+        b_hidden = b_hid + V_batch @ self.W
+        D = np.sqrt(Gamma_hid**2 + b_hidden**2)
+        tanh_D = np.tanh(D)
+        
+        H_pos_b = (b_hidden / D) * tanh_D
+        H_pos_Gamma = (Gamma_hid / D) * tanh_D
 
-        H_pos_b_expected = np.zeros((1, self.n_hidden))
-        H_pos_Gamma_expected = np.zeros((1, self.n_hidden))
-        W_pos_expected = np.zeros((self.n_visible, self.n_hidden))
-        for i in self.prob_data.keys():
-            V_data = np.array(Discretizer.int_to_bit_vector(i, self.n_visible)).reshape(1, -1)
-            V_data = self._binary_to_eigen(V_data)
+        self.H_pos_b_expected = np.sum(probs * H_pos_b, axis=0, keepdims=True)
+        self.H_pos_Gamma_expected = np.sum(probs * H_pos_Gamma, axis=0, keepdims=True)
+        self.W_pos_expected = V_batch.T @ (probs * H_pos_b)
 
-            b_hidden = self.b[self.n_visible :] + V_data @ self.W
-            D = np.sqrt(self.Gamma[self.n_visible :]**2 + b_hidden**2)
-            H_pos_b = (b_hidden / D) * np.tanh(D)
-            H_pos_Gamma = (self.Gamma[self.n_visible :] / D) * np.tanh(D)
-
-            H_pos_b_expected += self.prob_data[i] * H_pos_b
-            H_pos_Gamma_expected += self.prob_data[i] * H_pos_Gamma
-            W_pos_expected += self.prob_data[i] * (V_data.T @ H_pos_b)
-
-        self.H_pos_b_expected = H_pos_b_expected
-        self.H_pos_Gamma_expected = H_pos_Gamma_expected
-        self.W_pos_expected = W_pos_expected
-
-        self.grads["b_pos"] = np.concatenate((self.expected_value_V[0], H_pos_b_expected[0]))
-        self.grads["Gamma_pos"] = H_pos_Gamma_expected[0]
-        self.grads["W_pos"] = W_pos_expected
+        self.grads["b_pos"] = np.concatenate((self.expected_value_V[0], self.H_pos_b_expected[0]))
+        self.grads["Gamma_pos"] = self.H_pos_Gamma_expected[0]
+        self.grads["W_pos"] = self.W_pos_expected
 
     def _compute_negative_grads(self):
         """
-        Computes the gradients for the negative phase
+        Computes the gradients for the negative phase (EM M-step) using vectorized NumPy.
         """
-
         p_model, Z = self.compute_p_model(self.prob_data)
+        
+        keys = list(self.prob_data.keys())
+        p_model_arr = np.array([p_model[i] for i in keys]).reshape(-1, 1)
 
-        expected_value_model = np.zeros((1, self.n_visible))
-        H_neg_b_expected = np.zeros((1, self.n_hidden))
-        H_neg_Gamma_expected = np.zeros((1, self.n_hidden))
-        W_neg_expected = np.zeros((self.n_visible, self.n_hidden))
-        for i in self.prob_data.keys():
-            V_data = np.array(Discretizer.int_to_bit_vector(i, self.n_visible)).reshape(1, -1)
-            V_data = self._binary_to_eigen(V_data)
+        V_batch = self.V_batch
+        b_hid = self.b[self.n_visible:]
+        Gamma_hid = self.Gamma[self.n_visible:]
 
-            b_hidden = self.b[self.n_visible :] + V_data @ self.W
-            D = np.sqrt(self.Gamma[self.n_visible :]**2 + b_hidden**2)
-            H_neg_b = (b_hidden / D) * np.tanh(D)
-            H_neg_Gamma = (self.Gamma[self.n_visible :] / D) * np.tanh(D)
+        b_hidden = b_hid + V_batch @ self.W
+        D = np.sqrt(Gamma_hid**2 + b_hidden**2)
+        tanh_D = np.tanh(D)
+        
+        H_neg_b = (b_hidden / D) * tanh_D
+        H_neg_Gamma = (Gamma_hid / D) * tanh_D
 
-            expected_value_model += p_model[i] * V_data
-            H_neg_b_expected += p_model[i] * H_neg_b
-            H_neg_Gamma_expected += p_model[i] * H_neg_Gamma
-            W_neg_expected += p_model[i] * (V_data.T @ H_neg_b)
+        expected_value_model = np.sum(p_model_arr * V_batch, axis=0, keepdims=True)
+        H_neg_b_expected = np.sum(p_model_arr * H_neg_b, axis=0, keepdims=True)
+        H_neg_Gamma_expected = np.sum(p_model_arr * H_neg_Gamma, axis=0, keepdims=True)
+        
+        W_neg_expected = V_batch.T @ (p_model_arr * H_neg_b)
 
         self.grads["b_neg"] = np.concatenate((expected_value_model[0], H_neg_b_expected[0]))
         self.grads["Gamma_neg"] = H_neg_Gamma_expected[0]
@@ -287,22 +286,26 @@ class sqRBM_em(QBMBase):
         return rho_data
 
     def compute_p_model(self, prob_data):
+        """
+        Computes the model probabilities and partition function Z using fully vectorized NumPy.
+        """
 
-        p_model_tilde = np.zeros(2**self.n_visible)
-        for i in prob_data.keys():
-            V_data = np.array(Discretizer.int_to_bit_vector(i, self.n_visible)).reshape(1, -1)
-            V_data = self._binary_to_eigen(V_data)
-            b_hidden = self.b[self.n_visible :] + V_data @ self.W
+        V_batch = self.V_batch               # Shape: (N, n_visible)
+        b_vis = self.b[:self.n_visible]      # Shape: (n_visible,)
+        b_hid = self.b[self.n_visible:]      # Shape: (n_hidden,)
+        Gamma_hid = self.Gamma[self.n_visible:] # Shape: (n_hidden,)
 
-            F = np.exp(np.dot(self.b[: self.n_visible], V_data[0]))
-            for j in range(0, self.n_hidden):
-                D = np.sqrt((self.Gamma[self.n_visible + j]) ** 2 + b_hidden[0][j]**2)
-                F *= np.exp(D) + np.exp(-D)
+        b_hidden = b_hid + V_batch @ self.W
+        D = np.sqrt(Gamma_hid**2 + b_hidden**2)
 
-            p_model_tilde[i] = F
+        hidden_factor = np.prod(2 * np.cosh(D), axis=1)
 
-        Z = p_model_tilde.sum()
-        p_model = p_model_tilde / Z
+        visible_factor = np.exp(V_batch @ b_vis)
+
+        F = visible_factor * hidden_factor
+
+        Z = np.sum(F)
+        p_model = F / Z
 
         return p_model, Z
 
